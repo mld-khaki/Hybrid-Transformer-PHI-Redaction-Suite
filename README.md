@@ -1,3 +1,7 @@
+<p align="center">
+  <img src=https://github.com/mld-khaki/Hybrid-Transformer-PHI-Redaction-Suite/blob/main/PHI_Redactor.png "Hybrid Transformer PHI Redaction Suite"/>
+</p>
+
 # Hybrid Transformer PHI Redaction Suite
 
 A hybrid transformer-based PHI (Protected Health Information) redaction
