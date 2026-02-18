@@ -57,6 +57,67 @@ from tkinter import ttk
 # -----------------------------
 # Utilities
 # -----------------------------
+def extract_spans(mask):
+    """
+    Given a 0/1 mask, return list of (start, end) spans
+    where mask==1. End is exclusive.
+    """
+    spans = []
+    n = len(mask)
+    i = 0
+    while i < n:
+        if mask[i] == 1:
+            start = i
+            while i < n and mask[i] == 1:
+                i += 1
+            spans.append((start, i))
+        else:
+            i += 1
+    return spans
+
+
+def spans_overlap(a, b):
+    """
+    Return True if span a and b overlap.
+    a, b = (start, end)
+    """
+    return not (a[1] <= b[0] or b[1] <= a[0])
+
+
+def span_level_metrics(gold_mask, pred_mask):
+    gold_spans = extract_spans(gold_mask)
+    pred_spans = extract_spans(pred_mask)
+
+    if not gold_spans:
+        return {
+            "gold_span_count": 0,
+            "detected_spans": 0,
+            "missed_spans": 0,
+            "span_recall": None
+        }
+
+    detected = 0
+    missed = 0
+
+    for g in gold_spans:
+        found = False
+        for p in pred_spans:
+            if spans_overlap(g, p):
+                found = True
+                break
+        if found:
+            detected += 1
+        else:
+            missed += 1
+
+    recall = detected / len(gold_spans)
+
+    return {
+        "gold_span_count": len(gold_spans),
+        "detected_spans": detected,
+        "missed_spans": missed,
+        "span_recall": recall
+    }
 
 def now_ts() -> str:
     return datetime.now().strftime("%Y-%m-%d %H:%M:%S")
@@ -90,21 +151,23 @@ def find_tsv_files(root: str) -> List[str]:
     return out
 
 
-def compute_redaction_mask(orig: str, redacted: str) -> List[int]:
-    """
-    Returns a list mask of length len(orig): 1 if orig char was replaced/deleted vs redacted.
-    (Insertions in redacted don't map to orig chars and are ignored.)
-    """
+def compute_redaction_mask(orig: str, red: str) -> List[int]:
     orig = normalize_text(orig)
-    red = normalize_text(redacted)
-    sm = difflib.SequenceMatcher(a=orig, b=red, autojunk=False)
+    red = normalize_text(red)
+
+    n = min(len(orig), len(red))
     mask = [0] * len(orig)
-    for tag, i1, i2, _j1, _j2 in sm.get_opcodes():
-        if tag in ("replace", "delete"):
-            # mark affected orig region
-            for i in range(i1, i2):
-                if 0 <= i < len(mask):
-                    mask[i] = 1
+
+    # Mark differing positions
+    for i in range(n):
+        if orig[i] != red[i]:
+            mask[i] = 1
+
+    # If red shorter → remaining orig chars considered deleted
+    if len(red) < len(orig):
+        for i in range(len(red), len(orig)):
+            mask[i] = 1
+
     return mask
 
 
@@ -229,6 +292,13 @@ def evaluate_pairs(pairs: List[FilePair], output_dir: str, log, stop_flag) -> Di
         "files_with_any_fn": 0,
         "files_with_any_fp": 0,
         "files_with_any_tp": 0,
+
+        # NEW SPAN METRICS
+        "gold_span_count": 0,
+        "detected_spans": 0,
+        "missed_spans": 0,
+        "files_with_missed_span": 0,
+
         "created_at": now_ts(),
     }
 
@@ -240,9 +310,17 @@ def evaluate_pairs(pairs: List[FilePair], output_dir: str, log, stop_flag) -> Di
         "pred_redacted_chars",
         "tp", "fp", "fn", "tn",
         "precision", "recall", "f1", "non_phi_retention",
+
+        # NEW SPAN FIELDS
+        "gold_span_count",
+        "detected_spans",
+        "missed_spans",
+        "span_recall",
+
         "has_pred",
         "notes",
     ]
+
 
     with open(per_file_csv, "w", newline="", encoding="utf-8") as f_csv, \
          open(per_file_jsonl, "w", encoding="utf-8") as f_jsonl:
@@ -306,6 +384,16 @@ def evaluate_pairs(pairs: List[FilePair], output_dir: str, log, stop_flag) -> Di
 
                     m = char_metrics(gold_mask, pred_mask)
 
+                    # --- Span-level metrics ---
+                    span_stats = span_level_metrics(gold_mask, pred_mask)
+
+                    agg["gold_span_count"] += span_stats["gold_span_count"]
+                    agg["detected_spans"] += span_stats["detected_spans"]
+                    agg["missed_spans"] += span_stats["missed_spans"]
+
+                    if span_stats["missed_spans"] > 0:
+                        agg["files_with_missed_span"] += 1
+
                     agg["tp"] += int(m["tp"])
                     agg["fp"] += int(m["fp"])
                     agg["fn"] += int(m["fn"])
@@ -328,9 +416,20 @@ def evaluate_pairs(pairs: List[FilePair], output_dir: str, log, stop_flag) -> Di
                         "recall": f"{m['recall']:.6f}",
                         "f1": f"{m['f1']:.6f}",
                         "non_phi_retention": f"{m['non_phi_retention']:.6f}",
+
+                        # NEW
+                        "gold_span_count": span_stats["gold_span_count"],
+                        "detected_spans": span_stats["detected_spans"],
+                        "missed_spans": span_stats["missed_spans"],
+                        "span_recall": (
+                            f"{span_stats['span_recall']:.6f}"
+                            if span_stats["span_recall"] is not None else ""
+                        ),
+
                         "has_pred": "yes",
                         "notes": ";".join(notes) if notes else "",
                     }
+
                     w.writerow(row)
                     f_jsonl.write(json.dumps(row, ensure_ascii=True) + "\n")
 
@@ -354,6 +453,12 @@ def evaluate_pairs(pairs: List[FilePair], output_dir: str, log, stop_flag) -> Di
                 w.writerow(row)
                 f_jsonl.write(json.dumps(row, ensure_ascii=True) + "\n")
 
+    # --- Global span-level recall ---
+    if agg["gold_span_count"] > 0:
+        agg["span_recall"] = agg["detected_spans"] / agg["gold_span_count"]
+    else:
+        agg["span_recall"] = None
+
     # Final summary if pred exists (global metrics)
     summary = dict(agg)
     if agg["tp"] + agg["fp"] + agg["fn"] + agg["tn"] > 0:
@@ -374,6 +479,7 @@ def evaluate_pairs(pairs: List[FilePair], output_dir: str, log, stop_flag) -> Di
             "f1": None,
             "non_phi_retention": None,
         })
+
 
     # Add a friendly "FN per file" headline number
     summary["files_with_any_fn_rate"] = safe_div(summary["files_with_any_fn"], max(1, summary["files_with_pred_present"]))
@@ -596,6 +702,17 @@ class App:
                     lines.append("Error signal (file-level):")
                     lines.append(f"  Files with any FN : {summary.get('files_with_any_fn')} (rate={summary.get('files_with_any_fn_rate'):.4f})")
                     lines.append(f"  Files with any FP : {summary.get('files_with_any_fp')}")
+                    
+                     # --- Span-level metrics ---
+                    if summary.get("span_recall") is not None:
+                        lines.append("")
+                        lines.append("Span-level metrics (entity-level safety):")
+                        lines.append(f"  Total gold spans : {summary.get('gold_span_count')}")
+                        lines.append(f"  Missed spans     : {summary.get('missed_spans')}")
+                        lines.append(f"  Span recall      : {summary.get('span_recall'):.6f}")
+                        lines.append(f"  Files w/ missed  : {summary.get('files_with_missed_span')}")
+                   
+                    
                 else:
                     lines.append("")
                     lines.append("Pred folder not provided -> dataset stats only (no precision/recall).")
